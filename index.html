@@ -1,0 +1,696 @@
+/**
+ * ระบบบริหารจัดการยานพาหนะ โรงเรียนดาริสสลามวิทยา
+ * ไฟล์: รหัส.gs (Backend Google Apps Script)
+ */
+
+var SHEET_REQUESTS = "Requests";
+var SHEET_VEHICLES = "Vehicles";
+var SHEET_PAYERS = "Payers";
+var ADMIN_PIN = "1234"; // รหัสผ่านแอดมิน (สามารถแก้ไขได้ตามต้องการ)
+var DRIVE_FOLDER_NAME = "Vehicle_System_Files";
+
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile("Index")
+    .setTitle("ระบบแจ้งซ่อมรถและเบิกจ่ายออนไลน์ - โรงเรียนดาริสสลามวิทยา")
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag("viewport", "width=device-width, initial-scale=1");
+}
+
+/**
+ * ตรวจสอบรหัส PIN ผู้ดูแลระบบ
+ */
+function verifyAdmin(pin) {
+  return String(pin).trim() === String(ADMIN_PIN);
+}
+
+/**
+ * ดึง URL ของ Web App ปัจจุบันสำหรับสร้าง QR Code ประจำรถ
+ */
+function getWebAppUrl() {
+  try {
+    return ScriptApp.getService().getUrl() || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+/**
+ * เตรียมชีตและหัวตารางอัตโนมัติหากยังไม่มี
+ */
+function getOrCreateSheet(sheetName, headers) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+    if (headers && headers.length > 0) {
+      sheet.appendRow(headers);
+      sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#e9ecef");
+    }
+  }
+  return sheet;
+}
+
+/**
+ * บันทึกไฟล์ Base64 ลง Google Drive และคืนค่า URL สำหรับเปิดดู
+ */
+function saveBase64ToDrive(base64Data, fileName) {
+  if (!base64Data) return "";
+  try {
+    var folders = DriveApp.getFoldersByName(DRIVE_FOLDER_NAME);
+    var folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(DRIVE_FOLDER_NAME);
+
+    var parts = base64Data.split(",");
+    var contentType = parts[0].match(/:(.*?);/)[1];
+    var bytes = Utilities.base64Decode(parts[1]);
+    var blob = Utilities.newBlob(bytes, contentType, fileName || ("File_" + Date.now() + ".png"));
+
+    var file = folder.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return file.getUrl();
+  } catch (e) {
+    Logger.log("Upload Error: " + e.message);
+    return "";
+  }
+}
+
+/**
+ * ตรวจสอบว่าพนักงานขับรถมีรายการเบิกค่าน้ำมันค้างดำเนินการหรือไม่
+ */
+function checkPendingByDriver(driverName) {
+  if (!driverName) return { isBlocked: false };
+  var cleanName = String(driverName).trim();
+  var sheet = getOrCreateSheet(SHEET_REQUESTS, [
+    "วันที่", "รหัสอ้างอิง", "ผู้แจ้ง", "รถยนต์", "รายละเอียด", "ความเร่งด่วน",
+    "เลขไมล์", "สถานะ", "หมายเหตุ", "ลิงก์ใบเสร็จ", "ประเภท", "จำนวนเงิน", "หลักฐาน/ลายเซ็น"
+  ]);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { isBlocked: false };
+
+  var data = sheet.getRange(2, 1, lastRow - 1, 13).getValues();
+  for (var i = data.length - 1; i >= 0; i--) {
+    var row = data[i];
+    var rDriver = String(row[2] || "").trim();
+    var rStatus = String(row[7] || "").trim();
+    var rImage = String(row[9] || "").trim();
+    var rType = String(row[10] || "").trim();
+    var rEvidence = String(row[12] || "").trim();
+
+    if (rDriver === cleanName && rType === "เบิกค่าน้ำมัน") {
+      if (rStatus === "ไม่อนุมัติ" || rStatus === "ยกเลิก") continue;
+
+      if (!rImage) {
+        return {
+          isBlocked: true,
+          reqId: String(row[1]),
+          reason: "ยังไม่ได้อัปโหลดใบเสร็จค่าน้ำมัน"
+        };
+      }
+      if (rStatus === "จ่ายเงินสดเรียบร้อย" && !rEvidence) {
+        return {
+          isBlocked: true,
+          reqId: String(row[1]),
+          reason: "ยังไม่ได้ลงลายเซ็นยืนยันรับเงินสด"
+        };
+      }
+    }
+  }
+  return { isBlocked: false };
+}
+
+/**
+ * บันทึกคำขอแจ้งซ่อม หรือ เบิกค่าน้ำมันใหม่
+ */
+function submitRequest(data) {
+  try {
+    var sheet = getOrCreateSheet(SHEET_REQUESTS, [
+      "วันที่", "รหัสอ้างอิง", "ผู้แจ้ง", "รถยนต์", "รายละเอียด", "ความเร่งด่วน",
+      "เลขไมล์", "สถานะ", "หมายเหตุ", "ลิงก์ใบเสร็จ", "ประเภท", "จำนวนเงิน", "หลักฐาน/ลายเซ็น"
+    ]);
+
+    var now = new Date();
+    var tz = Session.getScriptTimeZone() || "Asia/Bangkok";
+    var dateStr = Utilities.formatDate(now, tz, "yyyy-MM-dd HH:mm");
+    var prefix = (data.requestType === "เบิกค่าน้ำมัน") ? "FUEL" : "REQ";
+    var reqId = prefix + Utilities.formatDate(now, tz, "yyMMddHHmmss");
+
+    var imageUrl = "";
+    if (data.imageFile) {
+      imageUrl = saveBase64ToDrive(data.imageFile, reqId + "_" + (data.imageName || "receipt.jpg"));
+    }
+
+    var sigUrl = "";
+    if (data.signatureData) {
+      sigUrl = saveBase64ToDrive(data.signatureData, "RequestSig_" + reqId + ".png");
+    }
+
+    var amountVal = parseFloat(String(data.amount || "0").replace(/,/g, "")) || 0;
+
+    sheet.appendRow([
+      dateStr,
+      reqId,
+      data.driverName || "-",
+      data.vehicleReg || "-",
+      data.issue || "-",
+      data.priority || "ปกติ",
+      data.mileage || "-",
+      "รออนุมัติ",
+      "",
+      imageUrl,
+      data.requestType || "แจ้งซ่อม",
+      amountVal,
+      sigUrl
+    ]);
+
+    return "ส่งข้อมูลสำเร็จ! รหัสอ้างอิงของคุณคือ: " + reqId;
+  } catch (e) {
+    return "เกิดข้อผิดพลาด: " + e.message;
+  }
+}
+
+/**
+ * ค้นหารายการตามรหัสอ้างอิง (หน้าพนักงานขับรถ)
+ */
+function searchRequest(reqId) {
+  if (!reqId) return null;
+  var target = String(reqId).trim().toUpperCase();
+  var sheet = getOrCreateSheet(SHEET_REQUESTS, []);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  var data = sheet.getRange(2, 1, lastRow - 1, 13).getValues();
+  for (var i = data.length - 1; i >= 0; i--) {
+    var row = data[i];
+    if (String(row[1] || "").trim().toUpperCase() === target) {
+      return {
+        date: String(row[0] || ""),
+        reqId: String(row[1] || ""),
+        driver: String(row[2] || ""),
+        vehicle: String(row[3] || ""),
+        detail: String(row[4] || ""),
+        priority: String(row[5] || ""),
+        mileage: String(row[6] || ""),
+        status: String(row[7] || ""),
+        note: String(row[8] || ""),
+        image: String(row[9] || ""),
+        type: String(row[10] || ""),
+        amount: row[11] || 0,
+        evidence: String(row[12] || "")
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * อัปโหลดใบเสร็จเพิ่มเติม หรือ บันทึกลายเซ็นรับเงินสดภายหลัง
+ */
+function uploadReceiptLater(reqId, fileObj) {
+  if (!reqId || !fileObj || !fileObj.imageFile) return "ไม่พบไฟล์ที่อัปโหลด";
+  var target = String(reqId).trim().toUpperCase();
+  var sheet = getOrCreateSheet(SHEET_REQUESTS, []);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return "ไม่พบข้อมูลในระบบ";
+
+  var data = sheet.getRange(2, 1, lastRow - 1, 13).getValues();
+  for (var i = 0; i < data.length; i++) {
+    if (String(data[i][1] || "").trim().toUpperCase() === target) {
+      var rowNum = i + 2;
+      var fileUrl = saveBase64ToDrive(fileObj.imageFile, fileObj.imageName || (target + "_file.png"));
+      if (String(fileObj.imageName || "").indexOf("Signature_") === 0) {
+        sheet.getRange(rowNum, 13).setValue(fileUrl);
+        return "บันทึกลายเซ็นรับเงินสดเรียบร้อยแล้ว!";
+      } else {
+        sheet.getRange(rowNum, 10).setValue(fileUrl);
+        return "อัปโหลดใบเสร็จเรียบร้อยแล้ว!";
+      }
+    }
+  }
+  return "ไม่พบรหัสอ้างอิงนี้";
+}
+
+/**
+ * ดึงรายการแจ้งซ่อมและเบิกจ่ายทั้งหมด (เรียงจากใหม่ไปเก่า)
+ */
+function getRequests() {
+  var sheet = getOrCreateSheet(SHEET_REQUESTS, [
+    "วันที่", "รหัสอ้างอิง", "ผู้แจ้ง", "รถยนต์", "รายละเอียด", "ความเร่งด่วน",
+    "เลขไมล์", "สถานะ", "หมายเหตุ", "ลิงก์ใบเสร็จ", "ประเภท", "จำนวนเงิน", "หลักฐาน/ลายเซ็น"
+  ]);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  var tz = Session.getScriptTimeZone() || "Asia/Bangkok";
+  var values = sheet.getRange(2, 1, lastRow - 1, 13).getValues();
+  var result = [];
+
+  for (var i = values.length - 1; i >= 0; i--) {
+    var row = values[i];
+    var dVal = row[0];
+    if (dVal instanceof Date) {
+      dVal = Utilities.formatDate(dVal, tz, "yyyy-MM-dd HH:mm");
+    } else {
+      dVal = String(dVal || "");
+    }
+    result.push([
+      dVal,
+      String(row[1] || ""),
+      String(row[2] || ""),
+      String(row[3] || ""),
+      String(row[4] || ""),
+      String(row[5] || ""),
+      String(row[6] || ""),
+      String(row[7] || ""),
+      String(row[8] || ""),
+      String(row[9] || ""),
+      String(row[10] || ""),
+      row[11] || 0,
+      String(row[12] || "")
+    ]);
+  }
+  return result;
+}
+
+/**
+ * อัปเดตสถานะ รายละเอียด อู่ซ่อม ยอดเงิน และไฟล์แนบโดยแอดมิน
+ */
+function updateRequest(reqId, status, note, cost, slipData, slipName, repairReceiptData, repairReceiptName) {
+  var target = String(reqId).trim().toUpperCase();
+  var sheet = getOrCreateSheet(SHEET_REQUESTS, []);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return "ไม่พบข้อมูล";
+
+  var data = sheet.getRange(2, 1, lastRow - 1, 13).getValues();
+  for (var i = 0; i < data.length; i++) {
+    if (String(data[i][1] || "").trim().toUpperCase() === target) {
+      var rowNum = i + 2;
+      sheet.getRange(rowNum, 8).setValue(status);
+      sheet.getRange(rowNum, 9).setValue(note || "");
+
+      if (cost !== "" && cost !== null && cost !== undefined) {
+        var numCost = parseFloat(String(cost).replace(/,/g, "")) || 0;
+        sheet.getRange(rowNum, 12).setValue(numCost);
+      }
+
+      if (slipData) {
+        var slipUrl = saveBase64ToDrive(slipData, slipName || ("Slip_" + target + ".jpg"));
+        if (slipUrl) sheet.getRange(rowNum, 13).setValue(slipUrl);
+      }
+
+      if (repairReceiptData) {
+        var recUrl = saveBase64ToDrive(repairReceiptData, repairReceiptName || ("Receipt_" + target + ".jpg"));
+        if (recUrl) sheet.getRange(rowNum, 10).setValue(recUrl);
+      }
+
+      return "อัปเดตข้อมูลเรียบร้อยแล้ว";
+    }
+  }
+  return "ไม่พบรหัสอ้างอิง";
+}
+
+/**
+ * ดึงข้อมูลคู่มือรถทั้งหมด
+ */
+function getVehicles() {
+  var sheet = getOrCreateSheet(SHEET_VEHICLES, [
+    "เลขทะเบียน", "จังหวัด", "วันจดทะเบียน", "ยี่ห้อ", "ประเภทรถ", "ลักษณะรถ",
+    "สีรถ", "เลขตัวรถ", "เลขตัวถัง", "ยี่ห้อเครื่องยนต์", "เลขเครื่องยนต์",
+    "ผู้ขับขี่ประจำ", "เบอร์โทร", "วันหมดอายุ พ.ร.บ.", "วันหมดอายุภาษี"
+  ]);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  var tz = Session.getScriptTimeZone() || "Asia/Bangkok";
+  var data = sheet.getRange(2, 1, lastRow - 1, 15).getValues();
+  var list = [];
+
+  function fmtDate(val) {
+    if (!val) return "";
+    if (val instanceof Date) return Utilities.formatDate(val, tz, "yyyy-MM-dd");
+    return String(val).trim();
+  }
+
+  for (var i = 0; i < data.length; i++) {
+    var r = data[i];
+    if (!r[0]) continue;
+    list.push({
+      reg: String(r[0] || "").trim(),
+      province: String(r[1] || "").trim(),
+      regDate: fmtDate(r[2]),
+      brand: String(r[3] || "").trim(),
+      vType: String(r[4] || "").trim(),
+      vStyle: String(r[5] || "").trim(),
+      color: String(r[6] || "").trim(),
+      vehicleNo: String(r[7] || "").trim(),
+      chassisNo: String(r[8] || "").trim(),
+      engineBrand: String(r[9] || "").trim(),
+      engineNo: String(r[10] || "").trim(),
+      driver: String(r[11] || "").trim(),
+      phone: String(r[12] || "").trim(),
+      prbExp: fmtDate(r[13]),
+      taxExp: fmtDate(r[14])
+    });
+  }
+  return list;
+}
+
+/**
+ * บันทึกหรือแก้ไขข้อมูลคู่มือรถ
+ */
+function saveVehicle(v) {
+  var sheet = getOrCreateSheet(SHEET_VEHICLES, [
+    "เลขทะเบียน", "จังหวัด", "วันจดทะเบียน", "ยี่ห้อ", "ประเภทรถ", "ลักษณะรถ",
+    "สีรถ", "เลขตัวรถ", "เลขตัวถัง", "ยี่ห้อเครื่องยนต์", "เลขเครื่องยนต์",
+    "ผู้ขับขี่ประจำ", "เบอร์โทร", "วันหมดอายุ พ.ร.บ.", "วันหมดอายุภาษี"
+  ]);
+
+  var rowValues = [
+    v.reg, v.province, v.regDate, v.brand, v.vType, v.vStyle,
+    v.color, v.vehicleNo, v.chassisNo, v.engineBrand, v.engineNo,
+    v.driver, v.phone, v.prbExp, v.taxExp
+  ];
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    var existingRegs = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (var i = 0; i < existingRegs.length; i++) {
+      if (String(existingRegs[i][0] || "").trim() === String(v.reg).trim()) {
+        sheet.getRange(i + 2, 1, 1, 15).setValues([rowValues]);
+        return "อัปเดตข้อมูลคู่มือรถทะเบียน " + v.reg + " เรียบร้อยแล้ว";
+      }
+    }
+  }
+
+  sheet.appendRow(rowValues);
+  return "เพิ่มข้อมูลคู่มือรถทะเบียน " + v.reg + " เรียบร้อยแล้ว";
+}
+
+/**
+ * ลบข้อมูลรถออกจากคู่มือ
+ */
+function deleteVehicle(reg) {
+  var sheet = getOrCreateSheet(SHEET_VEHICLES, []);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return "ไม่พบข้อมูล";
+
+  var existingRegs = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  for (var i = 0; i < existingRegs.length; i++) {
+    if (String(existingRegs[i][0] || "").trim() === String(reg).trim()) {
+      sheet.deleteRow(i + 2);
+      return "ลบข้อมูลรถทะเบียน " + reg + " เรียบร้อยแล้ว";
+    }
+  }
+  return "ไม่พบทะเบียนรถนี้";
+}
+
+/**
+ * บันทึกค่าใช้จ่ายต่อทะเบียน / พ.ร.บ. และอัปเดตวันหมดอายุรอบใหม่ลงคู่มือรถ
+ */
+function submitTaxRenewal(payload) {
+  try {
+    var reqSheet = getOrCreateSheet(SHEET_REQUESTS, [
+      "วันที่", "รหัสอ้างอิง", "ผู้แจ้ง", "รถยนต์", "รายละเอียด", "ความเร่งด่วน",
+      "เลขไมล์", "สถานะ", "หมายเหตุ", "ลิงก์ใบเสร็จ", "ประเภท", "จำนวนเงิน", "หลักฐาน/ลายเซ็น"
+    ]);
+
+    var now = new Date();
+    var tz = Session.getScriptTimeZone() || "Asia/Bangkok";
+    var dateStr = Utilities.formatDate(now, tz, "yyyy-MM-dd HH:mm");
+    var taxId = "TAX" + Utilities.formatDate(now, tz, "yyMMddHHmmss");
+
+    var prbCost = parseFloat(payload.prbCost) || 0;
+    var taxCost = parseFloat(payload.taxCost) || 0;
+    var inspectCost = parseFloat(payload.inspectCost) || 0;
+    var totalCost = prbCost + taxCost + inspectCost;
+
+    var detailParts = [];
+    if (prbCost > 0) detailParts.push("ค่า พ.ร.บ. " + prbCost + " บาท");
+    if (taxCost > 0) detailParts.push("ค่าภาษีประจำปี " + taxCost + " บาท");
+    if (inspectCost > 0) detailParts.push("ค่าตรวจสภาพ/อื่นๆ " + inspectCost + " บาท");
+    var detailSummary = detailParts.length > 0 ? detailParts.join(" + ") : "ต่ออายุ พ.ร.บ. และภาษีประจำปี";
+
+    var receiptUrl = "";
+    if (payload.receiptFile) {
+      receiptUrl = saveBase64ToDrive(payload.receiptFile, payload.receiptName || (taxId + "_receipt.jpg"));
+    }
+
+    reqSheet.appendRow([
+      dateStr,
+      taxId,
+      payload.driverName || "-",
+      payload.vehicleDisplay || payload.reg,
+      detailSummary,
+      "ปกติ",
+      "-",
+      payload.status || "จ่ายเงินสดเรียบร้อย",
+      payload.note || "",
+      receiptUrl,
+      "ต่อทะเบียน/พ.ร.บ.",
+      totalCost,
+      ""
+    ]);
+
+    // อัปเดตวันหมดอายุรอบใหม่ลงในชีต Vehicles
+    if (payload.reg && (payload.newPrbExp || payload.newTaxExp)) {
+      var vSheet = getOrCreateSheet(SHEET_VEHICLES, []);
+      var vLast = vSheet.getLastRow();
+      if (vLast >= 2) {
+        var regs = vSheet.getRange(2, 1, vLast - 1, 1).getValues();
+        for (var i = 0; i < regs.length; i++) {
+          if (String(regs[i][0] || "").trim() === String(payload.reg).trim()) {
+            if (payload.newPrbExp) vSheet.getRange(i + 2, 14).setValue(payload.newPrbExp);
+            if (payload.newTaxExp) vSheet.getRange(i + 2, 15).setValue(payload.newTaxExp);
+            break;
+          }
+        }
+      }
+    }
+
+    return {
+      success: true,
+      message: "บันทึกข้อมูลต่อทะเบียน/พ.ร.บ. เรียบร้อยแล้ว (รหัส: " + taxId + ")"
+    };
+  } catch (e) {
+    return {
+      success: false,
+      message: "เกิดข้อผิดพลาด: " + e.message
+    };
+  }
+}
+
+/**
+ * จัดการรายชื่อผู้จ่ายเงิน / ฝ่ายบัญชี
+ */
+function getPayers() {
+  var sheet = getOrCreateSheet(SHEET_PAYERS, ["ชื่อหน่วยงาน/ผู้จ่ายเงิน"]);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    var defaults = ["โรงเรียนดาริสสลามวิทยา", "ฝ่ายการเงินและบัญชี โรงเรียนดาริสสลามวิทยา"];
+    defaults.forEach(function(d) { sheet.appendRow([d]); });
+    return defaults;
+  }
+  var vals = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  return vals.map(function(r) { return String(r[0] || "").trim(); }).filter(Boolean);
+}
+
+function addPayer(name) {
+  if (!name) return "กรุณาระบุชื่อ";
+  var sheet = getOrCreateSheet(SHEET_PAYERS, ["ชื่อหน่วยงาน/ผู้จ่ายเงิน"]);
+  sheet.appendRow([String(name).trim()]);
+  return "เพิ่มรายชื่อผู้จ่ายเงินเรียบร้อยแล้ว";
+}
+
+/**
+ * ดึงข้อมูลแดชบอร์ดรายคันเมื่อสแกน QR Code (?car=เลขทะเบียน)
+ */
+function getVehicleDashboardData(regQuery) {
+  if (!regQuery) return null;
+  var cleanTarget = String(regQuery).replace(/\s+/g, "").trim().toLowerCase();
+
+  var vehicles = getVehicles() || [];
+  var foundVehicle = null;
+
+  for (var i = 0; i < vehicles.length; i++) {
+    var v = vehicles[i];
+    var vRegClean = String(v.reg || "").replace(/\s+/g, "").trim().toLowerCase();
+    if (vRegClean && (vRegClean === cleanTarget || cleanTarget.indexOf(vRegClean) === 0 || vRegClean.indexOf(cleanTarget) === 0)) {
+      foundVehicle = v;
+      break;
+    }
+  }
+
+  var allRequests = getRequests() || [];
+  var matchedRecords = [];
+  var totalFuel = 0;
+  var totalRepair = 0;
+  var totalTax = 0;
+  var totalCount = 0;
+
+  var targetRawReg = foundVehicle ? String(foundVehicle.reg || "").replace(/\s+/g, " ").trim() : String(regQuery).trim();
+
+  for (var j = 0; j < allRequests.length; j++) {
+    var row = allRequests[j];
+    if (!row || !Array.isArray(row)) continue;
+
+    var rowVehicle = String(row[3] || "").replace(/\s+/g, " ").trim();
+    var rowVehicleNoSpace = rowVehicle.replace(/\s+/g, "").toLowerCase();
+
+    var isMatch = false;
+    if (cleanTarget && rowVehicleNoSpace.indexOf(cleanTarget) !== -1) {
+      isMatch = true;
+    } else if (targetRawReg && rowVehicle.indexOf(targetRawReg) !== -1) {
+      isMatch = true;
+    }
+
+    if (isMatch) {
+      var rawDate = row[0] ? String(row[0]) : "";
+      var fDate = rawDate.length >= 10 ? rawDate.substring(0, 10) : rawDate;
+      var reqId = row[1] ? String(row[1]) : "-";
+      var driver = row[2] ? String(row[2]) : "-";
+      var detail = row[4] ? String(row[4]) : "-";
+      var priority = row[5] ? String(row[5]) : "-";
+      var mileage = row[6] ? String(row[6]) : "-";
+      var status = row[7] ? String(row[7]) : "-";
+      var note = row[8] ? String(row[8]) : "";
+      var imageLink = row[9] ? String(row[9]) : "";
+      var type = row[10] ? String(row[10]) : "แจ้งซ่อม";
+      var amtStr = String(row[11] || "0").replace(/,/g, "").trim();
+      var amount = parseFloat(amtStr) || 0;
+
+      totalCount++;
+      if (type === "เบิกค่าน้ำมัน") {
+        totalFuel += amount;
+      } else if (type === "ต่อทะเบียน/พ.ร.บ." || reqId.indexOf("TAX") === 0) {
+        totalTax += amount;
+      } else {
+        totalRepair += amount;
+      }
+
+      matchedRecords.push({
+        date: fDate,
+        reqId: reqId,
+        driver: driver,
+        vehicle: rowVehicle,
+        detail: detail,
+        priority: priority,
+        mileage: mileage,
+        status: status,
+        note: note,
+        image: imageLink,
+        type: type,
+        amount: amount
+      });
+    }
+  }
+
+  return {
+    vehicle: foundVehicle,
+    queryReg: regQuery,
+    summary: {
+      totalFuel: totalFuel,
+      totalRepair: totalRepair,
+      totalTax: totalTax,
+      grandTotal: totalFuel + totalRepair + totalTax,
+      totalCount: totalCount
+    },
+    recent5: matchedRecords.slice(0, 5)
+  };
+}
+
+/**
+ * สร้างข้อมูลรายงานสำหรับหน้าผู้ดูแลระบบ
+ * รองรับกรองประเภท ช่วงวันที่ และทะเบียนรถ โดยอ่านจากชีต Requests
+ */
+function getVehicleReportData(filters) {
+  try {
+    filters = filters || {};
+    var sheet = getOrCreateSheet(SHEET_REQUESTS, [
+      "วันที่", "รหัสอ้างอิง", "ผู้แจ้ง", "รถยนต์", "รายละเอียด", "ความเร่งด่วน",
+      "เลขไมล์", "สถานะ", "หมายเหตุ", "ลิงก์ใบเสร็จ", "ประเภท", "จำนวนเงิน", "หลักฐาน/ลายเซ็น"
+    ]);
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      return { success: true, records: [], summary: { count: 0, fuel: 0, repair: 0, tax: 0, total: 0 } };
+    }
+
+    var values = sheet.getRange(2, 1, lastRow - 1, 13).getValues();
+    var tz = Session.getScriptTimeZone() || "Asia/Bangkok";
+    var typeFilter = String(filters.type || "ALL");
+    var from = String(filters.dateFrom || "").trim();
+    var to = String(filters.dateTo || "").trim();
+    var vehicleFilter = String(filters.vehicle || "ALL").trim();
+    var records = [];
+    var summary = { count: 0, fuel: 0, repair: 0, tax: 0, total: 0 };
+
+    function dateKey(value) {
+      if (!value) return "";
+      if (value instanceof Date) return Utilities.formatDate(value, tz, "yyyy-MM-dd");
+      var str = String(value).trim();
+      var iso = str.match(/^(\d{4}-\d{2}-\d{2})/);
+      if (iso) return iso[1];
+      var dmy = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      if (dmy) {
+        var year = Number(dmy[3]);
+        if (year > 2400) year -= 543;
+        return year + "-" + ("0" + dmy[2]).slice(-2) + "-" + ("0" + dmy[1]).slice(-2);
+      }
+      return "";
+    }
+
+    var completedStatuses = ["จ่ายเงินสดเรียบร้อย", "ซ่อมเสร็จสิ้น"];
+    var excludedStatuses = ["ไม่อนุมัติ", "ยกเลิก"];
+
+    values.forEach(function(row) {
+      var rawDate = row[0];
+      var key = dateKey(rawDate);
+      var reqId = String(row[1] || "");
+      var driver = String(row[2] || "-");
+      var vehicle = String(row[3] || "-");
+      var detail = String(row[4] || "-");
+      var status = String(row[7] || "-");
+      var type = String(row[10] || "แจ้งซ่อม");
+      var amount = parseFloat(String(row[11] || "0").replace(/,/g, "")) || 0;
+
+      if (from && (!key || key < from)) return;
+      if (to && (!key || key > to)) return;
+      if (vehicleFilter !== "ALL" && vehicle.trim() !== vehicleFilter) return;
+
+      if (typeFilter !== "ALL" && typeFilter !== "STATUS_PENDING" && typeFilter !== "STATUS_DONE" && type !== typeFilter) return;
+      if (typeFilter === "STATUS_PENDING" && (completedStatuses.indexOf(status) !== -1 || excludedStatuses.indexOf(status) !== -1)) return;
+      if (typeFilter === "STATUS_DONE" && completedStatuses.indexOf(status) === -1) return;
+
+      var dateText = rawDate instanceof Date
+        ? Utilities.formatDate(rawDate, tz, "dd/MM/yyyy")
+        : String(rawDate || "-");
+      records.push({
+        date: dateText,
+        dateKey: key,
+        reqId: reqId,
+        driver: driver,
+        vehicle: vehicle,
+        detail: detail,
+        mileage: String(row[6] || "-"),
+        status: status,
+        note: String(row[8] || ""),
+        receiptUrl: String(row[9] || ""),
+        type: type,
+        amount: amount,
+        evidenceUrl: String(row[12] || "")
+      });
+
+      summary.count++;
+      summary.total += amount;
+      if (type === "เบิกค่าน้ำมัน") summary.fuel += amount;
+      else if (type === "ต่อทะเบียน/พ.ร.บ." || reqId.indexOf("TAX") === 0) summary.tax += amount;
+      else summary.repair += amount;
+    });
+
+    records.sort(function(a, b) {
+      if (a.dateKey === b.dateKey) return b.reqId.localeCompare(a.reqId);
+      return b.dateKey.localeCompare(a.dateKey);
+    });
+
+    return { success: true, records: records, summary: summary };
+  } catch (err) {
+    return { success: false, message: "สร้างรายงานไม่สำเร็จ: " + err.message };
+  }
+}
